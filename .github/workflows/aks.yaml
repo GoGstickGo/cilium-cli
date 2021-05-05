@@ -19,19 +19,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.2
-
-      - name: Set up Go for root
-        run: |
-          sudo ln -sf `which go` `sudo which go` || true
-          sudo go version
-
-      - name: Build and install cilium CLI binary
-        run: sudo make install
-
       - name: Azure Login
         uses: azure/login@v1
         with:
@@ -54,9 +41,46 @@ jobs:
             --network-plugin azure \
             --generate-ssh-keys
 
+      - name: Set job vars
+        id: vars
+        run: |
+          if [ ${{ github.event.issue.pull_request || github.event.pull_request }} ]; then
+            PR_API_JSON=$(curl \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              ${{ github.event.issue.pull_request.url || github.event.pull_request.url }})
+            SHA=$(echo "$PR_API_JSON" | jq -r ".head.sha")
+            OWNER=$(echo "$PR_API_JSON" | jq -r ".number")
+            IS_PR=true
+          else
+            SHA=${{ github.sha }}
+            OWNER=${{ github.sha }}
+          fi
+          echo ::set-output name=sha::${SHA}
+
       - name: Get Credentials
         run: |
           az aks get-credentials --name ${{ env.clusterName }} --resource-group cilium-ci
+
+      - name: Create gcloud-free kubeconfig and load it in configmap
+        run: |
+          .github/get-kubeconfig.sh
+          kubectl create configmap cilium-cli-kubeconfig -n kube-system --from-file kubeconfig
+
+      - name: Load test script in configmap
+        run: |
+          kubectl create configmap cilium-cli-test-script -n kube-system --from-file .github/in-cluster-test-script.sh
+
+      - name: Create cilium-cli job
+        run: |
+          helm install .github/cilium-cli-test-job-chart --generate-name \
+          --set tag=${{ steps.vars.outputs.sha }} \
+          --set cluster_name=${{ env.clusterName }} \
+          --set cluster_cidr=${{ steps.vars.outputs.cluster_cidr }}
+
+      - name: Wait for job
+        run: |
+          kubectl -n kube-system wait job/cilium-cli --for=condition=complete --timeout=10m
 
       - name: Install cilium
         run: |
